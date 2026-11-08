@@ -261,6 +261,75 @@ fn account(user: &str) -> io::Result<(Account, bool)> {
     Ok((current, false))
 }
 
+/// Without a launcher: the account's login shell or `exec` command, run as
+/// the account when the server runs as root. Returns the user to hand the
+/// terminal to.
+fn login(req: &SpawnRequest<'_>, config: &Config) -> io::Result<(Command, Option<u32>)> {
+    let (account, switch_user) = account(req.user)?;
+    let shell = [config.shell.as_deref(), Some(account.shell.as_str())]
+        .into_iter()
+        .flatten()
+        .find(|s| !s.is_empty())
+        .unwrap_or("/bin/sh")
+        .to_owned();
+    let mut cmd = Command::new(&shell);
+    match req.command {
+        Some(command) => {
+            cmd.arg(command_flag(&shell))
+                .arg(OsStr::from_bytes(command));
+        }
+        None => {
+            // A leading '-' in argv[0] asks for a login shell.
+            let name = Path::new(&shell).file_name().unwrap_or(OsStr::new("sh"));
+            cmd.arg0(format!("-{}", name.to_string_lossy()));
+        }
+    }
+    let home = match Path::new(&account.home).is_dir() {
+        true => account.home.as_str(),
+        false => "/",
+    };
+    cmd.env_clear()
+        .env("HOME", home)
+        .env("USER", &account.name)
+        .env("LOGNAME", &account.name)
+        .env("SHELL", &shell)
+        .env("PATH", PATH)
+        .current_dir(home);
+    lead_session(&mut cmd, req.pty.is_some());
+    let identity =
+        switch_user.then(|| (account.uid, account.gid, groups(&account.name, account.gid)));
+    let owner = identity.as_ref().map(|(uid, ..)| *uid);
+    if let Some((uid, gid, groups)) = identity {
+        // SAFETY: the hook runs between fork and exec and only makes
+        // async-signal-safe system calls on data prepared before the fork.
+        unsafe {
+            cmd.pre_exec(move || {
+                check(ffi::setgroups(groups.len(), groups.as_ptr()))?;
+                check(ffi::setgid(gid))?;
+                check(ffi::setuid(uid))?;
+                Ok(())
+            });
+        }
+    }
+    Ok((cmd, owner))
+}
+
+/// Makes the process the leader of a new session, with the terminal (its
+/// standard input) as its controlling terminal when there is one.
+fn lead_session(cmd: &mut Command, pty: bool) {
+    // SAFETY: the hook runs between fork and exec and only makes
+    // async-signal-safe system calls.
+    unsafe {
+        cmd.pre_exec(move || {
+            check(ffi::setsid())?;
+            if pty {
+                check(ffi::ioctl(0, ffi::TIOCSCTTY, 0))?;
+            }
+            Ok(())
+        });
+    }
+}
+
 /// The session's process.
 pub(crate) struct Process {
     pub(crate) input: Input,
@@ -269,58 +338,19 @@ pub(crate) struct Process {
 }
 
 impl Process {
-    /// Starts the login shell or `exec` command for `req`.
+    /// Starts the process for `req`: the [`Launcher`](crate::Launcher)'s, or
+    /// the account's login shell or `exec` command.
     pub(crate) async fn spawn(req: &SpawnRequest<'_>, config: &Config) -> io::Result<Self> {
-        let (account, switch_user) = account(req.user)?;
-        let shell = [config.shell.as_deref(), Some(account.shell.as_str())]
-            .into_iter()
-            .flatten()
-            .find(|s| !s.is_empty())
-            .unwrap_or("/bin/sh")
-            .to_owned();
-        let mut cmd = Command::new(&shell);
-        match req.command {
-            Some(command) => {
-                cmd.arg(command_flag(&shell))
-                    .arg(OsStr::from_bytes(command));
-            }
-            None => {
-                // A leading '-' in argv[0] asks for a login shell.
-                let name = Path::new(&shell).file_name().unwrap_or(OsStr::new("sh"));
-                cmd.arg0(format!("-{}", name.to_string_lossy()));
-            }
-        }
-        let home = match Path::new(&account.home).is_dir() {
-            true => account.home.as_str(),
-            false => "/",
-        };
-        cmd.env_clear()
-            .env("HOME", home)
-            .env("USER", &account.name)
-            .env("LOGNAME", &account.name)
-            .env("SHELL", &shell)
-            .env("PATH", PATH)
-            .current_dir(home);
-        let identity =
-            switch_user.then(|| (account.uid, account.gid, groups(&account.name, account.gid)));
         let pty = req.pty.is_some();
-        let user = identity.as_ref().map(|(uid, ..)| *uid);
-        // SAFETY: the hook runs between fork and exec and only makes
-        // async-signal-safe system calls on data prepared before the fork.
-        unsafe {
-            cmd.pre_exec(move || {
-                check(ffi::setsid())?;
-                if pty {
-                    check(ffi::ioctl(0, ffi::TIOCSCTTY, 0))?;
-                }
-                if let Some((uid, gid, groups)) = &identity {
-                    check(ffi::setgroups(groups.len(), groups.as_ptr()))?;
-                    check(ffi::setgid(*gid))?;
-                    check(ffi::setuid(*uid))?;
-                }
-                Ok(())
-            });
-        }
+        let (mut cmd, owner) = match &config.launcher {
+            Some(launcher) => {
+                let launch = launcher.launch(req)?;
+                let mut cmd = launch.command;
+                lead_session(&mut cmd, pty);
+                (cmd, launch.terminal_owner)
+            }
+            None => login(req, config)?,
+        };
         if let Some(pty) = &req.pty {
             if !pty.term.is_empty() {
                 cmd.env("TERM", pty.term);
@@ -328,7 +358,7 @@ impl Process {
             let (master, slave) = open_pty(pty.size)?;
             // Like login, hand the terminal to the user (keeping the group
             // devpts gave it): programs that reopen it would fail otherwise.
-            if let Some(uid) = user {
+            if let Some(uid) = owner {
                 check(ffi::fchown(slave.as_raw_fd(), uid, u32::MAX))?;
             }
             cmd.stdin(slave.try_clone()?)

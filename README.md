@@ -98,7 +98,10 @@ tinyssh::serve(listener, config).await // never returns
 `HostKey::generate()` creates a host key from OS randomness; `to_seed()`
 returns the 32 bytes to store. `Config::authorizer` accepts anything
 implementing `Authorizer`, including closures `Fn(&str, &PublicKey) -> bool`;
-`AuthorizedKeys` is a plain list of keys allowed for every user.
+`AuthorizedKeys` is a plain list of keys allowed for every user. On Linux,
+`Config::launcher` likewise accepts a `Launcher`, including closures
+`Fn(&SpawnRequest) -> io::Result<Launch>`, to start sessions the embedding
+program's way (see [Processes](#processes)).
 
 To run your own event loop, use `Arena`, `Connection` and `Event` directly:
 copy socket input into `read_buf()`, call `poll()` until it returns `None`,
@@ -111,6 +114,15 @@ write `write_buf()` to the socket, and move session data with `stdin()`,
   groups in `/etc/group`; the shell runs with those credentials, in a new
   session with the pty as controlling terminal, as a login shell (`-sh`).
 * **Linux, unprivileged:** the shell runs as the server's own user.
+* **Linux, with a launcher:** `Config::launcher` replaces both of the above.
+  It returns the `std::process::Command` to run (program, arguments,
+  environment, working directory and credentials, for example through
+  `CommandExt::uid` or a `pre_exec` hook); tinyssh connects it to the
+  terminal or to pipes, sets `TERM`, makes it a session leader with the
+  terminal as its controlling terminal (in a `pre_exec` hook that runs after
+  the command's), and gives the terminal to `Launch::terminal_owner`. An init
+  can run sessions as the accounts of its own configuration this way, with
+  no `/etc/passwd` entries.
 * **Windows:** the shell (`Config::shell` or `%COMSPEC%`) runs as the server's
   own account, in a ConPTY when a terminal was requested and with pipes
   otherwise. `exec` commands run as `cmd.exe /s /c "<command>"`, so quoted
@@ -180,8 +192,11 @@ targets.
   4251 examples. The same client also runs over TCP against the real driver
   and processes, checking that a session's end is reported while the window
   is closed, that input stops when the shell exits, that closing a session
-  hangs up the jobs its shell left behind and reaps the shell, and that a
-  session that runs to completion leaves its jobs alone. `tests/driver.rs`
+  hangs up the jobs its shell left behind and reaps the shell, that a
+  session that runs to completion leaves its jobs alone, and that a
+  launcher's process gets its environment and working directory, leads its
+  session with the terminal as its controlling terminal, and reports a
+  failed launch. `tests/driver.rs`
   checks the login timeout (also against a client flooding a
   current-thread runtime) and the connection limit.
 * `src/cipher/` checks the VAES AES-GCM against the GCM specification's test
