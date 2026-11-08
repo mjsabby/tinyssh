@@ -104,6 +104,8 @@ mod conn;
 mod curve25519;
 mod kex;
 mod keys;
+#[cfg(target_os = "linux")]
+mod launch;
 mod rng;
 mod server;
 mod sha256;
@@ -121,6 +123,8 @@ use std::time::Duration;
 
 pub use conn::{Arena, Connection, Event, Memory, Pty, SpawnRequest, WinSize};
 pub use keys::{AuthorizedKeys, Authorizer, HostKey, PublicKey};
+#[cfg(target_os = "linux")]
+pub use launch::{Launch, Launcher};
 pub use server::{serve, serve_connection};
 
 /// Identification string sent to clients (RFC 4253 §4.2), without CR LF.
@@ -135,8 +139,14 @@ pub struct Config {
     /// Program to run instead of the account's login shell. `exec` requests
     /// run `<shell> -c <command>` (on Windows with the command quoted as one
     /// argument), except with `cmd.exe` (the default on Windows, from
-    /// `%COMSPEC%`): `cmd.exe /s /c "<command>"`.
+    /// `%COMSPEC%`): `cmd.exe /s /c "<command>"`. Not used with a
+    /// `launcher` (Linux).
     pub shell: Option<String>,
+    /// Starts session processes the embedding program's way, in place of
+    /// the account lookup, login shell and environment described under
+    /// [`shell`](Self::shell). Linux only; `None` by default.
+    #[cfg(target_os = "linux")]
+    pub launcher: Option<Box<dyn Launcher>>,
     /// Start a key re-exchange after this many bytes in either direction.
     /// Defaults to 4 GiB.
     pub rekey_limit: u64,
@@ -161,6 +171,8 @@ impl Config {
             host_key,
             authorizer: Box::new(authorizer),
             shell: None,
+            #[cfg(target_os = "linux")]
+            launcher: None,
             rekey_limit: 1 << 32,
             window_size: 2 * 1024 * 1024,
             max_auth_attempts: 6,

@@ -534,6 +534,73 @@ async fn finished_sessions_leave_background_jobs_running() {
     assert!(alive, "the job was signalled when the session finished");
 }
 
+/// A launcher chooses the program, environment and working directory;
+/// tinyssh still connects the terminal, sets `TERM`, makes the process a
+/// session leader with the terminal as its controlling terminal, and reports
+/// its exit status.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn launchers_start_sessions_their_way() {
+    use std::os::unix::ffi::OsStrExt;
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("tinyssh-{}-launched", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let cwd = dir.clone();
+    let (mut stream, mut client) = tcp_login_with(move |c| {
+        c.launcher = Some(Box::new(move |req: &crate::SpawnRequest<'_>| {
+            assert_eq!(req.user, "tester");
+            let mut command = std::process::Command::new("/bin/sh");
+            command
+                .arg("-c")
+                .arg(std::ffi::OsStr::from_bytes(req.command.unwrap_or_default()))
+                .env_clear()
+                .env("GREETING", "launched")
+                .current_dir(&cwd);
+            Ok(crate::Launch {
+                command,
+                terminal_owner: None,
+            })
+        }));
+    })
+    .await;
+    client.open_session().unwrap();
+    exchange(&mut stream, &mut client, |c| c.channel.is_some()).await;
+    client.pty(b"xterm", 80, 24).unwrap();
+    // Fields 1, 6 and 7 of /proc/PID/stat: the process, its session and its
+    // controlling terminal.
+    let command = format!(
+        "set -- $(cat /proc/$$/stat); echo \"$GREETING $TERM $PWD $1 $6 $7\" > {}; exit 5",
+        path.display()
+    );
+    client.exec(command.as_bytes()).unwrap();
+    exchange(&mut stream, &mut client, |c| c.closed).await;
+    assert_eq!(client.exit_status, Some(5));
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    let fields: Vec<&str> = text.split_whitespace().collect();
+    assert_eq!(fields[..3], ["launched", "xterm", dir.to_str().unwrap()]);
+    assert_eq!(fields[3], fields[4], "not a session leader: {text}");
+    assert_ne!(fields[5], "0", "no controlling terminal: {text}");
+}
+
+/// A launch that fails ends the session like any process that cannot start.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn failed_launches_are_reported() {
+    let (mut stream, mut client) = tcp_login_with(|c| {
+        c.launcher = Some(Box::new(|_: &crate::SpawnRequest<'_>| {
+            Err(std::io::Error::other("no session for you"))
+        }));
+    })
+    .await;
+    client.open_session().unwrap();
+    exchange(&mut stream, &mut client, |c| c.channel.is_some()).await;
+    client.exec(b"true").unwrap();
+    exchange(&mut stream, &mut client, |c| c.closed).await;
+    assert_eq!(client.exit_status, Some(127));
+    assert!(client.stderr > 0);
+}
+
 #[test]
 fn exec_session_echoes_data_and_reports_exit_status() {
     let mut h = setup(|_| {});
