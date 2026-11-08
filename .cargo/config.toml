@@ -1,0 +1,6 @@
+# tinyssh is compiled for x86-64 with AVX2, BMI2, ADX, AES-NI, PCLMULQDQ,
+# VAES, VPCLMULQDQ and SHA-NI (AMD Zen 3+, Intel Ice Lake+) and checks nothing
+# at run time; src/lib.rs refuses to compile without these features. Programs
+# that depend on tinyssh need the same flags in their own build.
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "target-cpu=x86-64-v3", "-C", "target-feature=+aes,+pclmulqdq,+vaes,+vpclmulqdq,+sha,+adx"]

@@ -1,0 +1,168 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# On main, runs wait for each other so that releases are published in commit
+# order (a newer push replaces a run that is still waiting); elsewhere a new
+# push cancels the previous run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Link the C runtime statically, so that the Windows binary does not need the
+  # Visual C++ redistributable.
+  CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
+
+jobs:
+  test:
+    name: Test ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # Clippy and the debug tests use the default target; the release tests
+        # and the binary use `target`. On Linux that is musl, so that the
+        # binary is static and runs on any distribution.
+        include:
+          - os: ubuntu-26.04
+            target: x86_64-unknown-linux-musl
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy --target ${{ matrix.target }} --no-self-update
+          rustup default stable
+
+      # tinyssh is compiled for these instructions and checks nothing at run
+      # time (see .cargo/config.toml), so fail clearly on a runner without them.
+      - name: Check CPU
+        shell: bash
+        run: |
+          grep -m1 'model name' /proc/cpuinfo || true
+          rustc --edition 2024 --crate-name cpu --out-dir "$RUNNER_TEMP" - <<'EOF'
+          use std::arch::is_x86_feature_detected as has;
+          fn main() {
+              let features = [
+                  ("avx2", has!("avx2")),
+                  ("bmi2", has!("bmi2")),
+                  ("adx", has!("adx")),
+                  ("aes", has!("aes")),
+                  ("pclmulqdq", has!("pclmulqdq")),
+                  ("vaes", has!("vaes")),
+                  ("vpclmulqdq", has!("vpclmulqdq")),
+                  ("sha", has!("sha")),
+              ];
+              let missing: Vec<&str> = features.iter().filter(|f| !f.1).map(|f| f.0).collect();
+              if !missing.is_empty() {
+                  println!("::error::This runner's CPU lacks {}; re-run the job", missing.join(", "));
+                  std::process::exit(1);
+              }
+          }
+          EOF
+          "$RUNNER_TEMP/cpu"
+
+      # The interop tests run `ssh` from PATH, which also has an MSYS2 build in
+      # Git's usr\bin; test against Windows' own OpenSSH.
+      - name: Use Windows' OpenSSH client
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Add-Content $env:GITHUB_PATH "$env:SystemRoot\System32\OpenSSH"
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Test (release)
+        run: cargo test --release --locked --target ${{ matrix.target }}
+
+      # Each binary's debug information goes to a separate file, which the
+      # executable names so that debuggers find it next to it: the PDB on
+      # Windows, and on Linux a .dbg file with the DWARF sections, which are
+      # stripped from the executable.
+      - name: Build tinysshd
+        shell: bash
+        run: |
+          name=tinysshd-${{ matrix.target }}
+          out=target/${{ matrix.target }}/dist/examples
+          mkdir dist
+          if [[ $RUNNER_OS == Windows ]]; then
+            cargo rustc --profile dist --locked --target ${{ matrix.target }} --example tinysshd \
+              -- -C "link-arg=-PDBALTPATH:$name.pdb"
+            cp "$out/tinysshd.exe" "dist/$name.exe"
+            cp "$out/tinysshd.pdb" "dist/$name.pdb"
+          else
+            cargo build --profile dist --locked --target ${{ matrix.target }} --example tinysshd
+            cp "$out/tinysshd" "dist/$name"
+            objcopy --only-keep-debug --compress-debug-sections=zlib "dist/$name" "dist/$name.dbg"
+            objcopy --strip-debug --add-gnu-debuglink="dist/$name.dbg" "dist/$name"
+          fi
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tinysshd-${{ matrix.target }}
+          path: dist
+          if-no-files-found: error
+          retention-days: 7
+
+  # Every successful run on main publishes the binaries as a release tagged
+  # v<version>-<commit>, which becomes the latest release.
+  release:
+    name: Release
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: tinysshd-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          commit=${GITHUB_SHA::7}
+          tag="v$version-$commit"
+          cd dist
+          sha256sum tinysshd-* > SHA256SUMS
+          existing=$(gh release view "$tag" --json targetCommitish --jq .targetCommitish 2> /dev/null || true)
+          if [[ -z $existing ]]; then
+            gh release create "$tag" tinysshd-* SHA256SUMS --target "$GITHUB_SHA" --latest \
+              --title "tinyssh $version ($commit)" --generate-notes \
+              --notes "Static tinysshd binaries for x86-64 Linux and Windows, built from $GITHUB_SHA, with their debug information in separate files (.dbg, .pdb). They need a CPU with AVX2, BMI2, ADX, AES-NI, PCLMULQDQ, VAES, VPCLMULQDQ and SHA-NI (AMD Zen 3 or Intel Ice Lake and later)."
+          elif [[ $existing == "$GITHUB_SHA" ]]; then
+            # A re-run for the same commit replaces the binaries.
+            gh release upload "$tag" tinysshd-* SHA256SUMS --clobber
+          else
+            echo "::error::Release $tag already exists for commit $existing"
+            exit 1
+          fi
